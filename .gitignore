@@ -26,13 +26,36 @@ coverage
 out/
 build
 dist
+*.tsbuildinfo
 
 
-# Debug
+# Debug & Logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+*.log
+logs/
 
 # Misc
 .DS_Store
 *.pem
+Thumbs.db
+
+# IDEs and Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+
+# Linting and formatting
+.eslintcache
+.prettiercache
+
+# Custom Paths
+/apps/server/generated
+
+# Prisma
+migration_lock.toml

@@ -1,0 +1,14 @@
+{
+  "extends": "@geosentinel/typescript-config/base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "sourceMap": true,
+    "rootDir": "./src",
+    "outDir": "dist",
+    "paths": {
+      "@geosentinel/shared": ["./src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

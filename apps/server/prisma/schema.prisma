@@ -1,0 +1,99 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum AssetType {
+  VEHICLE
+  WORKER
+  EQUIPMENT
+}
+
+enum AssetStatus {
+  ACTIVE
+  IDLE
+  STALE
+  OFFLINE
+}
+
+enum AlertType {
+  GEOFENCE_ENTER
+  GEOFENCE_EXIT
+  PROXIMITY
+  SPEEDING
+  STALE_ASSET
+  LOW_BATTERY
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+model Asset {
+  id        String      @id @default(cuid())
+  name      String
+  type      AssetType
+  status    AssetStatus @default(OFFLINE)
+  metadata  Json?
+  createdAt DateTime    @default(now()) @map("created_at")
+  updatedAt DateTime    @updatedAt @map("updated_at")
+  positions Position[]
+  alerts    Alert[]
+
+  @@map("assets")
+}
+
+model Position {
+  id         String   @id @default(cuid())
+  assetId    String   @map("asset_id")
+  asset      Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  speed      Float
+  heading    Float
+  battery    Float?
+  recordedAt DateTime @default(now()) @map("recorded_at")
+
+  // PostGIS geography column is created in migrations:
+  // location geography(Point, 4326) NOT NULL
+
+  @@index([assetId, recordedAt])
+  @@map("positions")
+}
+
+model Geofence {
+  id        String   @id @default(cuid())
+  name      String
+  color     String   @default("#0ea5e9")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  alerts    Alert[]
+
+  // PostGIS geography column is created in migrations:
+  // boundary geography(Polygon, 4326) NOT NULL
+
+  @@map("geofences")
+}
+
+model Alert {
+  id         String        @id @default(cuid())
+  assetId    String        @map("asset_id")
+  asset      Asset         @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  geofenceId String?       @map("geofence_id")
+  geofence   Geofence?     @relation(fields: [geofenceId], references: [id], onDelete: SetNull)
+  type       AlertType
+  severity   AlertSeverity @default(WARNING)
+  message    String
+  readAt     DateTime?     @map("read_at")
+  createdAt  DateTime      @default(now()) @map("created_at")
+
+  @@index([assetId, createdAt])
+  @@index([type, createdAt])
+  @@map("alerts")
+}
