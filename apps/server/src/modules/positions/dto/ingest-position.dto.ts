@@ -1,8 +1,9 @@
-import { IsLatitude, IsLongitude, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsLatitude, IsLongitude, IsNumber, IsOptional, IsString, Max, Min, IsISO8601 } from 'class-validator';
 
 export class IngestPositionDto {
+  @IsOptional()
   @IsString()
-  assetId!: string;
+  assetId?: string;
 
   @IsLatitude()
   lat!: number;
@@ -24,4 +25,8 @@ export class IngestPositionDto {
   @Min(0)
   @Max(100)
   battery?: number;
+
+  @IsOptional()
+  @IsISO8601()
+  recordedAt?: string;
 }
