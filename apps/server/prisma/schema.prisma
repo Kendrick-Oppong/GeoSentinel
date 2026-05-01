@@ -1,12 +1,30 @@
+// =============================================================================
+// GeoSentinel — Prisma Schema
+// =============================================================================
+// IMPORTANT: PostGIS geography columns (location, boundary, location_at_event)
+// are declared as Unsupported("geography") — Prisma cannot generate queries
+// for these. All spatial reads/writes use prisma.$queryRaw with sql-template-tag.
+//
+// Run order:
+//   1. prisma migrate dev          → creates all tables (no spatial cols yet)
+//   2. psql < 001_enable_postgis.sql  → enables extension
+//   3. psql < 002_spatial_columns.sql → adds geography columns + GIST indexes
+//   4. psql < 003_partitioning.sql    → converts positions to partitioned table
+//   5. psql < 004_seed.sql            → seeds initial data for development
+// =============================================================================
+
 generator client {
-  provider     = "prisma-client"
-  output       = "../generated/prisma"
-  moduleFormat = "cjs"
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
 }
+
+// =============================================================================
+// ENUMS
+// =============================================================================
 
 enum AssetType {
   VEHICLE
@@ -15,85 +33,437 @@ enum AssetType {
 }
 
 enum AssetStatus {
-  ACTIVE
-  IDLE
-  STALE
-  OFFLINE
+  ACTIVE // Moving, sending pings
+  IDLE // Stationary, still sending pings (no movement > 5 min)
+  STALE // Last ping > 2 min ago, position uncertain
+  OFFLINE // Last ping > 10 min ago, considered unreachable
 }
 
 enum AlertType {
-  GEOFENCE_ENTER
-  GEOFENCE_EXIT
-  PROXIMITY
-  SPEEDING
-  STALE_ASSET
-  LOW_BATTERY
+  GEOFENCE_ENTER // Asset entered a geofence
+  GEOFENCE_EXIT // Asset exited a geofence
+  PROXIMITY_WARNING // Two assets within proximity threshold
+  IDLE_TIMEOUT // Asset has been idle beyond configured threshold
+  SPEED_ANOMALY // Position implies impossible speed from last known
+  GPS_DRIFT // Asset appears stationary but coordinates vary slightly
+  LOW_BATTERY // Battery below configured threshold (default: 20%)
+  OFFLINE // Asset has gone offline
+  STATE_CHANGE // General state transition alert
 }
 
 enum AlertSeverity {
-  INFO
-  WARNING
-  CRITICAL
+  INFO // Informational — no action required
+  WARNING // Operator should be aware
+  CRITICAL // Immediate attention required (proximity, offline)
 }
 
-model Asset {
-  id        String      @id @default(cuid())
-  name      String
-  type      AssetType
-  status    AssetStatus @default(OFFLINE)
-  metadata  Json?
-  createdAt DateTime    @default(now()) @map("created_at")
-  updatedAt DateTime    @updatedAt @map("updated_at")
-  positions Position[]
-  alerts    Alert[]
+enum AlertTypeCategory {
+  GEOFENCE
+  PROXIMITY
+  DEVICE
+  SYSTEM
+}
 
+enum GeofenceAlertMode {
+  BREACH // Alert on both entry and exit
+  ENTRY_ONLY // Alert only when entering
+  EXIT_ONLY // Alert only when exiting
+  INFORMATIONAL // Track membership, no alerts
+}
+
+enum AuditAction {
+  CREATED
+  UPDATED
+  DELETED
+  STATE_CHANGED
+}
+
+enum AuditEntityType {
+  ASSET
+  GEOFENCE
+  ALERT
+  API_KEY
+  SETTINGS
+}
+
+enum ApiKeyStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+// =============================================================================
+// MODELS
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Asset — A tracked entity (vehicle, worker, or equipment)
+// -----------------------------------------------------------------------------
+model Asset {
+  id     String      @id @default(uuid()) @db.Uuid
+  name   String      @db.VarChar(100)
+  type   AssetType
+  status AssetStatus @default(ACTIVE)
+
+  // Optional descriptive fields
+  description String? @db.VarChar(500)
+  identifier  String? @db.VarChar(100) // Physical identifier: plate number, badge ID, serial
+  color       String  @default("#3B82F6") @db.VarChar(7) // Hex color for map marker
+
+  // Operational thresholds — overrides system defaults per asset
+  proximity_threshold_metres Int? // Override default 50m proximity alert
+  idle_timeout_seconds       Int? // Override default 300s idle detection
+  stale_timeout_seconds      Int? // Override default 120s stale detection
+  low_battery_threshold      Int? // Override default 20% battery warning
+  max_speed_kmh              Int? // Override default 250 km/h anomaly filter
+
+  // Soft delete — assets are never hard deleted (preserves history)
+  is_deleted Boolean   @default(false)
+  deleted_at DateTime?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Relations
+  positions            Position[]
+  alerts               Alert[]              @relation("AssetAlerts")
+  related_alerts       Alert[]              @relation("RelatedAssetAlerts")
+  geofence_memberships GeofenceMembership[]
+  api_keys             ApiKey[]
+  settings             AssetSettings?
+
+  @@index([status])
+  @@index([type])
+  @@index([is_deleted])
   @@map("assets")
 }
 
+// -----------------------------------------------------------------------------
+// AssetSettings — Per-asset configurable thresholds (normalized out of Asset)
+// -----------------------------------------------------------------------------
+model AssetSettings {
+  id       String @id @default(uuid()) @db.Uuid
+  asset_id String @unique @db.Uuid
+
+  // Speed display
+  speed_unit String @default("kmh") @db.VarChar(10) // kmh | mph | knots
+
+  // Alert preferences
+  alerts_enabled       Boolean @default(true)
+  sound_alerts_enabled Boolean @default(false)
+  email_alerts_enabled Boolean @default(false)
+
+  // Proximity thresholds by asset type pair (stored as JSON for flexibility)
+  // Example: { "VEHICLE_WORKER": 50, "VEHICLE_VEHICLE": 20, "WORKER_WORKER": 5 }
+  proximity_thresholds Json @default("{}")
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  asset Asset @relation(fields: [asset_id], references: [id], onDelete: Cascade)
+
+  @@map("asset_settings")
+}
+
+// -----------------------------------------------------------------------------
+// Position — Every GPS coordinate ever received (hot table, partitioned by month)
+//
+// IMPORTANT: The `location` column is NOT in this Prisma schema because it is
+// a PostGIS GEOGRAPHY(POINT, 4326) type. It is added via raw SQL migration
+// (002_spatial_columns.sql). Prisma will ignore it — all spatial reads/writes
+// for this column use prisma.$queryRaw.
+//
+// This table is converted to a RANGE-partitioned table in 003_partitioning.sql.
+// Prisma migrations must be run BEFORE the partitioning migration.
+// -----------------------------------------------------------------------------
 model Position {
-  id         String   @id @default(cuid())
-  assetId    String   @map("asset_id")
-  asset      Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
-  speed      Float
-  heading    Float
-  battery    Float?
-  recordedAt DateTime @default(now()) @map("recorded_at")
+  id       BigInt @id @default(autoincrement())
+  asset_id String @db.Uuid
 
-  // PostGIS geography column is created in migrations:
-  // location geography(Point, 4326) NOT NULL
+  // location GEOGRAPHY(POINT, 4326) — added via raw SQL, not Prisma
+  // Prisma cannot manage PostGIS geography columns.
 
-  @@index([assetId, recordedAt])
+  // Scalar fields Prisma CAN manage
+  speed    Decimal? @db.Decimal(6, 2) // km/h
+  heading  Decimal? @db.Decimal(5, 2) // 0–359 degrees
+  battery  Int? // 0–100 percent
+  altitude Decimal? @db.Decimal(8, 2) // metres above sea level
+  accuracy Decimal? @db.Decimal(6, 2) // GPS accuracy radius in metres
+
+  // Quality flags — set by server during ingestion validation
+  is_drift        Boolean @default(false) // Flagged as GPS drift (displacement < 10m, speed < 2 km/h)
+  is_suspect      Boolean @default(false) // Flagged as impossible speed from previous position
+  is_interpolated Boolean @default(false) // Generated by interpolation, not from device
+
+  // Timestamps — recorded_at comes from device, received_at is server time
+  // CRITICAL: All time-range queries use recorded_at, not received_at
+  // This ensures out-of-order positions are handled correctly
+  recorded_at DateTime // From device — partition key
+  received_at DateTime @default(now())
+
+  asset Asset @relation(fields: [asset_id], references: [id])
+
+  // Unique constraint prevents duplicate ingestion (idempotent POST /positions)
+  // Network retries send the same recorded_at → silently ignored, not errored
+  @@unique([asset_id, recorded_at])
+  // Composite index for time-range queries per asset (most common query pattern)
+  @@index([asset_id, recorded_at(sort: Desc)])
+  // Index on quality flags for analytics queries
+  @@index([is_suspect])
+  @@index([is_drift])
   @@map("positions")
 }
 
+// -----------------------------------------------------------------------------
+// Geofence — A geographic boundary that triggers alerts when assets cross it
+//
+// IMPORTANT: The `boundary` column is NOT in this Prisma schema because it is
+// a PostGIS GEOGRAPHY(POLYGON, 4326) type. Added via 002_spatial_columns.sql.
+// -----------------------------------------------------------------------------
 model Geofence {
-  id        String   @id @default(cuid())
-  name      String
-  color     String   @default("#0ea5e9")
-  isActive  Boolean  @default(true) @map("is_active")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-  alerts    Alert[]
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String  @db.VarChar(200)
+  description String? @db.VarChar(1000)
 
-  // PostGIS geography column is created in migrations:
-  // boundary geography(Polygon, 4326) NOT NULL
+  // Visual properties
+  color        String  @default("#3B82F6") @db.VarChar(7) // Fill color hex
+  opacity      Decimal @default(0.2) @db.Decimal(3, 2) // Fill opacity 0–1
+  stroke_color String  @default("#1D4ED8") @db.VarChar(7) // Outline color hex
+  stroke_width Int     @default(2) // Outline width px
 
+  // boundary GEOGRAPHY(POLYGON, 4326) — added via raw SQL
+  // area_km2 is stored denormalized for fast analytics queries
+  area_km2 Decimal? @db.Decimal(12, 4) // Calculated on insert, stored here
+
+  // Behavior configuration
+  alert_mode GeofenceAlertMode @default(BREACH)
+  is_active  Boolean           @default(true)
+
+  // Soft delete
+  is_deleted Boolean   @default(false)
+  deleted_at DateTime?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Relations
+  memberships GeofenceMembership[]
+  alerts      Alert[]
+
+  @@index([is_active, is_deleted])
   @@map("geofences")
 }
 
-model Alert {
-  id         String        @id @default(cuid())
-  assetId    String        @map("asset_id")
-  asset      Asset         @relation(fields: [assetId], references: [id], onDelete: Cascade)
-  geofenceId String?       @map("geofence_id")
-  geofence   Geofence?     @relation(fields: [geofenceId], references: [id], onDelete: SetNull)
-  type       AlertType
-  severity   AlertSeverity @default(WARNING)
-  message    String
-  readAt     DateTime?     @map("read_at")
-  createdAt  DateTime      @default(now()) @map("created_at")
+// -----------------------------------------------------------------------------
+// GeofenceMembership — Tracks which assets are currently inside which geofences
+//
+// This table is the source of truth for "is asset X currently inside geofence Y?"
+// It is updated on every position ingestion:
+//   - Asset enters geofence → INSERT row
+//   - Asset exits geofence  → DELETE row + create GEOFENCE_EXIT alert
+//
+// It survives server restarts (unlike an in-memory Map).
+// Cascades on geofence delete — no orphaned memberships.
+// -----------------------------------------------------------------------------
+model GeofenceMembership {
+  asset_id    String @db.Uuid
+  geofence_id String @db.Uuid
 
-  @@index([assetId, createdAt])
-  @@index([type, createdAt])
+  // When the asset entered — used for "time spent inside" analytics
+  entered_at DateTime @default(now())
+
+  // Position snapshot at entry — stored for analytics / audit
+  // entry_location GEOGRAPHY(POINT) — added via raw SQL
+
+  asset    Asset    @relation(fields: [asset_id], references: [id])
+  geofence Geofence @relation(fields: [geofence_id], references: [id], onDelete: Cascade)
+
+  @@id([asset_id, geofence_id])
+  @@map("geofence_memberships")
+}
+
+// -----------------------------------------------------------------------------
+// Alert — Every event that requires operator attention
+// -----------------------------------------------------------------------------
+model Alert {
+  id       String @id @default(uuid()) @db.Uuid
+  asset_id String @db.Uuid
+
+  // The geofence that triggered this alert (null for non-geofence alerts)
+  geofence_id String? @db.Uuid
+
+  // For proximity alerts — the other asset involved
+  related_asset_id String? @db.Uuid
+
+  type     AlertType
+  severity AlertSeverity @default(WARNING)
+
+  message String @db.VarChar(500)
+
+  // location_at_event GEOGRAPHY(POINT) — added via raw SQL
+  // Captures exact coordinates when the alert fired (for map flyTo on click)
+
+  // Operator acknowledgment
+  is_read Boolean   @default(false)
+  read_at DateTime?
+
+  // For proximity alerts: the distance that triggered it
+  distance_metres  Decimal? @db.Decimal(8, 2)
+  threshold_metres Int?
+
+  // For speed anomaly alerts: the computed impossible speed
+  computed_speed_kmh Decimal? @db.Decimal(8, 2)
+
+  created_at DateTime @default(now())
+
+  asset         Asset     @relation("AssetAlerts", fields: [asset_id], references: [id])
+  geofence      Geofence? @relation(fields: [geofence_id], references: [id], onDelete: SetNull)
+  related_asset Asset?    @relation("RelatedAssetAlerts", fields: [related_asset_id], references: [id], onDelete: SetNull)
+
+  @@index([asset_id, created_at(sort: Desc)])
+  @@index([is_read])
+  @@index([type])
+  @@index([severity])
+  @@index([created_at(sort: Desc)])
   @@map("alerts")
+}
+
+// -----------------------------------------------------------------------------
+// ApiKey — Device authentication keys for POST /positions
+//
+// Each simulated asset (and each real GPS device) has its own key.
+// Keys are hashed before storage — the raw key is shown once on creation.
+// -----------------------------------------------------------------------------
+model ApiKey {
+  id       String @id @default(uuid()) @db.Uuid
+  asset_id String @db.Uuid
+
+  // key_hash: bcrypt hash of the actual key
+  // The raw key is NEVER stored. Shown once at creation, then lost.
+  key_hash String @db.VarChar(255)
+
+  // key_prefix: first 12 chars of the raw key for identification
+  // Example: "geosentinel_" — shown in the UI to identify which key
+  key_prefix String @db.VarChar(20)
+
+  label  String       @db.VarChar(100) // Human name: "Simulator Key", "Device Primary"
+  status ApiKeyStatus @default(ACTIVE)
+
+  // Rate limiting config per key
+  rate_limit_per_minute Int @default(200)
+
+  last_used_at DateTime?
+  expires_at   DateTime? // null = never expires
+
+  created_at DateTime  @default(now())
+  revoked_at DateTime?
+
+  asset Asset @relation(fields: [asset_id], references: [id], onDelete: Cascade)
+
+  @@index([asset_id])
+  @@index([status])
+  @@map("api_keys")
+}
+
+// -----------------------------------------------------------------------------
+// SystemSettings — Global configuration for the entire platform
+// One row only — enforced via a check constraint in raw SQL.
+// -----------------------------------------------------------------------------
+model SystemSettings {
+  id Int @id @default(1) // Always 1 — singleton pattern
+
+  // Proximity alert defaults (overridden per asset in AssetSettings)
+  default_proximity_vehicle_worker_metres  Int @default(50)
+  default_proximity_vehicle_vehicle_metres Int @default(20)
+  default_proximity_worker_worker_metres   Int @default(5)
+
+  // State transition timeouts
+  idle_timeout_seconds    Int @default(300) // 5 minutes
+  stale_timeout_seconds   Int @default(120) // 2 minutes
+  offline_timeout_seconds Int @default(600) // 10 minutes
+
+  // Ingestion validation
+  min_displacement_metres Int @default(10) // Below this + low speed = drift
+  max_speed_kmh           Int @default(250) // Above this = anomaly
+  drift_max_speed_kmh     Int @default(2) // Speed threshold for drift detection
+
+  // Battery alert threshold
+  low_battery_threshold Int @default(20) // Alert when battery below this %
+
+  // Position history retention
+  history_retention_days Int @default(90) // Partitions older than this are dropped
+
+  // Map defaults
+  default_map_center_lng Decimal @default(-0.1870) @db.Decimal(10, 7) // Accra
+  default_map_center_lat Decimal @default(5.6037) @db.Decimal(10, 7)
+  default_map_zoom       Decimal @default(12.0) @db.Decimal(4, 1)
+
+  updated_at DateTime @updatedAt
+
+  @@map("system_settings")
+}
+
+// -----------------------------------------------------------------------------
+// AuditLog — Immutable record of all state changes across the system
+//
+// Written to by: assets CRUD, geofence CRUD, api key operations.
+// Never updated or deleted — append only.
+// -----------------------------------------------------------------------------
+model AuditLog {
+  id          BigInt          @id @default(autoincrement())
+  entity_type AuditEntityType
+  entity_id   String          @db.Uuid
+  action      AuditAction
+
+  // JSON snapshots of before/after state
+  old_value Json?
+  new_value Json?
+
+  // Who/what triggered the change
+  // For API key operations: key_prefix
+  // For system operations: 'system'
+  triggered_by String @default("system") @db.VarChar(100)
+
+  ip_address String? @db.VarChar(45) // IPv4 or IPv6
+  user_agent String? @db.VarChar(500)
+
+  created_at DateTime @default(now())
+
+  @@index([entity_type, entity_id])
+  @@index([created_at(sort: Desc)])
+  @@map("audit_log")
+}
+
+// -----------------------------------------------------------------------------
+// PositionIngestionLog — Fast append-only log of raw ingestion attempts
+//
+// Separate from Position table — captures both successful and failed ingestion.
+// Used for debugging device issues, rate limiting analysis, anomaly investigation.
+// Partitioned by day in raw SQL (high volume).
+// -----------------------------------------------------------------------------
+model IngestionLog {
+  id         BigInt  @id @default(autoincrement())
+  asset_id   String? @db.Uuid // null if key was invalid (unknown asset)
+  key_prefix String? @db.VarChar(20)
+
+  // Result of ingestion
+  success                Boolean
+  failure_reason         String? @db.VarChar(200)
+  alerts_triggered_count Int     @default(0)
+  was_drift              Boolean @default(false)
+  was_suspect            Boolean @default(false)
+
+  // Raw payload fields for debugging
+  raw_lat     Decimal? @db.Decimal(10, 7)
+  raw_lng     Decimal? @db.Decimal(10, 7)
+  raw_speed   Decimal? @db.Decimal(6, 2)
+  raw_battery Int?
+
+  processing_ms Int? // Server-side processing time in milliseconds
+
+  received_at DateTime @default(now())
+
+  @@index([asset_id, received_at(sort: Desc)])
+  @@index([success])
+  @@map("ingestion_log")
 }
