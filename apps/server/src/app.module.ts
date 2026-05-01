@@ -12,7 +12,6 @@ import { PositionsModule } from './modules/positions/positions.module';
 import { RealtimeModule } from './modules/realtime/realtime.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { PrismaModule } from './prisma/prisma.module';
 
 @Module({
   imports: [
@@ -21,7 +20,6 @@ import { PrismaModule } from './prisma/prisma.module';
       isGlobal: true,
       validate: validateEnv,
     }),
-    PrismaModule,
     LoggerModule.forRoot(),
     ScheduleModule.forRoot(),
     DatabaseModule,
