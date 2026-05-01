@@ -80,6 +80,7 @@
   }
 
   body {
+    font-family: "Bai Jamjuree", sans-serif;
     @apply bg-background text-foreground antialiased;
   }
 }
