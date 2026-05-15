@@ -10,7 +10,7 @@ const environmentSchema = z
   })
   .passthrough();
 
-export type Environment = z.infer<typeof environmentSchema>;
+export type Environment = z.infer<typeof environmentSchema>
 
 export function validateEnv(config: Record<string, unknown>) {
   const result = environmentSchema.safeParse(config);
@@ -23,5 +23,5 @@ export function validateEnv(config: Record<string, unknown>) {
     throw new Error(`Environment validation failed: ${messages}`);
   }
 
-  return result.data satisfies Environment;
+  return result.data satisfies Environment
 }
